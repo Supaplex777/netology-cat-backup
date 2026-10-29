@@ -125,7 +125,8 @@ def backup_cat(text, client, folder=GROUP_FOLDER, report_path=RESULT_FILE):
             )
 
     size = metadata.get("size")
-    if not isinstance(size, int):
+    # bool — подкласс int в Python, поэтому исключаем его явно.
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
         raise YandexDiskError("Яндекс.Диск не сообщил размер файла.")
 
     record = {
@@ -149,41 +150,73 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+# Коды завершения программы.
+EXIT_OK = 0
+EXIT_DISK_ERROR = 1
+EXIT_BAD_TEXT = 2
+EXIT_NO_INPUT = 3
+EXIT_REPORT_ERROR = 4
+EXIT_INTERRUPTED = 130
+
+
+class InputUnavailableError(Exception):
+    """Нет интерактивного ввода (например, stdin закрыт или пуст)."""
+
+
+def ask(prompt, hidden=False):
+    """Запросить строку у пользователя; EOF превратить в понятную ошибку."""
+    try:
+        if hidden:
+            return getpass.getpass(prompt)
+        return input(prompt)
+    except EOFError as error:
+        raise InputUnavailableError from error
+
+
 def main(argv=None, client_factory=YandexDiskClient):
     args = parse_args(argv)
     token = load_token()
     setup_logging(token)
     logger.info("Запуск резервного копирования")
 
-    text = " ".join(args.text) if args.text else input(
-        "Введите текст для картинки: ")
     try:
+        if args.text:
+            text = " ".join(args.text)
+        else:
+            text = ask("Введите текст для картинки: ")
         text = validate_text(text)
-    except InvalidTextError as error:
-        logger.error("Некорректный текст: %s", error)
-        return 2
 
-    if not token:
-        logger.info("Переменная %s не задана, токен будет запрошен",
-                    TOKEN_ENV_VAR)
-        token = getpass.getpass("Введите OAuth-токен Яндекс.Диска "
-                                "(ввод скрыт): ").strip()
-        setup_logging(token)
+        if not token:
+            logger.info("Переменная %s не задана, токен будет запрошен",
+                        TOKEN_ENV_VAR)
+            token = ask("Введите OAuth-токен Яндекс.Диска (ввод скрыт): ",
+                        hidden=True).strip()
+            setup_logging(token)
 
-    try:
         client = client_factory(token)
         backup_cat(text, client, report_path=args.result)
+    except InputUnavailableError:
+        logger.error(
+            "Не удалось прочитать ввод с клавиатуры. Передайте текст "
+            "аргументом (python main.py \"Текст\") и задайте токен в "
+            "переменной %s или в файле .env.", TOKEN_ENV_VAR)
+        return EXIT_NO_INPUT
     except InvalidTextError as error:
         logger.error("Некорректный текст: %s", error)
-        return 2
+        return EXIT_BAD_TEXT
     except YandexDiskError as error:
         logger.error("Ошибка Яндекс.Диска: %s", error)
-        return 1
+        return EXIT_DISK_ERROR
+    except OSError as error:
+        logger.error("Не удалось записать отчёт %s: %s. Файл на Диске "
+                     "при этом мог быть загружен.", args.result,
+                     error.strerror or type(error).__name__)
+        return EXIT_REPORT_ERROR
     except KeyboardInterrupt:
-        logger.error("Остановлено пользователем")
-        return 130
+        logger.error("Остановлено пользователем (Ctrl+C)")
+        return EXIT_INTERRUPTED
     logger.info("Готово!")
-    return 0
+    return EXIT_OK
 
 
 if __name__ == "__main__":

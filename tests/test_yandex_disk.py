@@ -1,16 +1,21 @@
 import pytest
 import requests
 
-from conftest import API, FAKE_TOKEN, FakeResponse
+from conftest import API, FAKE_TOKEN, NO_BODY, FakeResponse
 from yandex_disk import (
     AuthorizationError,
     ConflictError,
     ConnectionProblemError,
+    ForbiddenError,
+    NotFoundError,
     RateLimitError,
+    ServerError,
+    UnexpectedResponseError,
     UploadFailedError,
     UploadTimeoutError,
     YandexDiskClient,
     YandexDiskError,
+    _error_text,
 )
 
 OPERATION = f"{API}/operations/abc123"
@@ -47,9 +52,12 @@ def test_invalid_token(make_client):
 
 
 def test_forbidden(make_client):
+    # По документации 403 — это запрет доступа или переполненное
+    # хранилище, а не неверный токен, поэтому это не AuthorizationError.
     client, _ = make_client(FakeResponse(403, {"description": "no rights"}))
-    with pytest.raises(AuthorizationError):
+    with pytest.raises(ForbiddenError, match="хранилище переполнено") as info:
         client.check_access()
+    assert not isinstance(info.value, AuthorizationError)
 
 
 def test_rate_limit(make_client):
@@ -59,7 +67,7 @@ def test_rate_limit(make_client):
 
 
 def test_http_server_error(make_client):
-    client, _ = make_client(FakeResponse(503, None, reason="Unavailable"))
+    client, _ = make_client(FakeResponse(503, NO_BODY, reason="Unavailable"))
     with pytest.raises(YandexDiskError, match="503"):
         client.check_access()
 
@@ -202,3 +210,140 @@ def test_move_async(make_client):
     )
     client.move("AIE-9/a.jpg", "AIE-9/a.png")
     assert len(session.calls) == 2
+
+
+# --- Регрессия: тело ответа любого типа не ломает обработку ошибок -------
+
+ODD_BODIES = [
+    pytest.param(["error", "list"], id="list"),
+    pytest.param("plain string", id="string"),
+    pytest.param(42, id="number"),
+    pytest.param(None, id="json-null"),
+    pytest.param(True, id="bool"),
+    pytest.param({}, id="empty-object"),
+    pytest.param({"description": 123, "message": None}, id="non-str-fields"),
+    pytest.param(NO_BODY, id="empty-or-invalid-json"),
+]
+
+
+@pytest.mark.parametrize("body", ODD_BODIES)
+def test_error_text_never_raises(body):
+    text = _error_text(FakeResponse(400, body, reason="Bad Request"))
+    assert isinstance(text, str) and text
+
+
+@pytest.mark.parametrize("body, expected", [
+    ({"description": "Описание ошибки"}, "Описание ошибки"),
+    ({"message": "Сообщение"}, "Сообщение"),
+    ({"error": "DiskNotFoundError"}, "DiskNotFoundError"),
+    ({"description": "  ", "message": "Запасной"}, "Запасной"),
+])
+def test_error_text_reads_object(body, expected):
+    assert _error_text(FakeResponse(400, body)) == expected
+
+
+def test_error_text_is_truncated():
+    text = _error_text(FakeResponse(400, {"description": "x" * 5000}))
+    assert len(text) == 200
+
+
+@pytest.mark.parametrize("code, hint", [
+    (413, "слишком большой"),
+    (423, "технические работы"),
+    (507, "свободного места"),
+])
+def test_error_text_hints_for_documented_codes(code, hint):
+    assert hint in _error_text(FakeResponse(code, NO_BODY))
+
+
+@pytest.mark.parametrize("body", ODD_BODIES)
+@pytest.mark.parametrize("code, error_class", [
+    (400, YandexDiskError),
+    (401, AuthorizationError),
+    (403, ForbiddenError),
+    (404, NotFoundError),
+    (409, ConflictError),
+    (429, RateLimitError),
+    (500, ServerError),
+    (503, ServerError),
+    (507, YandexDiskError),
+])
+def test_http_errors_with_any_body(make_client, code, error_class, body):
+    client, _ = make_client(FakeResponse(code, body))
+    with pytest.raises(error_class) as info:
+        client.check_access()
+    assert FAKE_TOKEN not in str(info.value)
+
+
+@pytest.mark.parametrize("body", [
+    pytest.param(["a"], id="list"),
+    pytest.param("text", id="string"),
+    pytest.param(None, id="json-null"),
+    pytest.param(NO_BODY, id="invalid-json"),
+])
+def test_success_with_non_object_body(make_client, body):
+    calls = [
+        ("check_access", ()),
+        ("get_metadata", ("AIE-9/a.jpg",)),
+        ("upload_from_url", ("https://x", "AIE-9/a.jpg")),
+        ("get_operation_status", (OPERATION,)),
+    ]
+    for name, args in calls:
+        client, _ = make_client(FakeResponse(200, body))
+        with pytest.raises(UnexpectedResponseError):
+            getattr(client, name)(*args)
+
+
+@pytest.mark.parametrize("body", [
+    pytest.param({"href": ""}, id="empty-href"),
+    pytest.param({"href": 5}, id="non-str-href"),
+    pytest.param({"href": OPERATION, "templated": True}, id="templated"),
+])
+def test_upload_bad_link(make_client, body):
+    client, _ = make_client(FakeResponse(202, body))
+    with pytest.raises(UnexpectedResponseError):
+        client.upload_from_url("https://x", "AIE-9/a.jpg")
+
+
+@pytest.mark.parametrize("body", [
+    pytest.param({}, id="no-status"),
+    pytest.param({"status": None}, id="null-status"),
+])
+def test_operation_without_status(make_client, body):
+    client, _ = make_client(FakeResponse(200, body))
+    with pytest.raises(UnexpectedResponseError):
+        client.get_operation_status(OPERATION)
+
+
+def test_move_async_without_href_is_clear_error(make_client):
+    # Раньше здесь был KeyError из response.json()["href"].
+    client, _ = make_client(FakeResponse(202, {}))
+    with pytest.raises(UnexpectedResponseError):
+        client.move("AIE-9/a.jpg", "AIE-9/a.png")
+
+
+def test_operation_href_with_query_id_is_supported(make_client):
+    # В документации загрузки ссылка имеет вид /operations?id=...
+    href = f"{API}/operations?id=33ca7d03"
+    client, session = make_client(FakeResponse(200, {"status": "success"}))
+    assert client.get_operation_status(href) == "success"
+    assert session.calls[0]["url"] == href
+
+
+# --- Совместимость URL CATAAS с загрузкой по URL -------------------------
+
+@pytest.mark.parametrize("text", ["Hello", "Привет мир", "a/b?c#d&e=f+g%"])
+def test_cat_url_survives_query_encoding(text):
+    """URL картинки передаётся в параметре url и доходит до Диска целиком."""
+    from urllib.parse import parse_qs, urlsplit
+
+    from cataas_api import build_cat_url
+
+    cat_url = build_cat_url(text)
+    prepared = requests.Request(
+        "POST", f"{API}/resources/upload",
+        params={"url": cat_url, "path": "AIE-9/x.jpg"},
+    ).prepare()
+    query = parse_qs(urlsplit(prepared.url).query)
+    assert query["url"] == [cat_url]
+    assert query["path"] == ["AIE-9/x.jpg"]

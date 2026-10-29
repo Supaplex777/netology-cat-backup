@@ -14,15 +14,19 @@ FAKE_TOKEN = "fake-test-token-0000000000"
 API = "https://cloud-api.yandex.net/v1/disk"
 
 
+# Маркер «тела нет / тело не JSON»: json() бросит ValueError, как requests.
+NO_BODY = object()
+
+
 class FakeResponse:
-    def __init__(self, status_code=200, json_data=None, reason=""):
+    def __init__(self, status_code=200, json_data=NO_BODY, reason=""):
         self.status_code = status_code
         self._json = json_data
         self.reason = reason
 
     def json(self):
-        if self._json is None:
-            raise ValueError("no json")
+        if self._json is NO_BODY:
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
         return self._json
 
 

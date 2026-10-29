@@ -1,6 +1,7 @@
 """Настройки программы и чтение OAuth-токена Яндекс.Диска."""
 
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -26,8 +27,16 @@ UPLOAD_POLL_INTERVAL = 2
 MAX_TEXT_LENGTH = 100
 
 
-def load_token():
-    """Вернуть токен из окружения (или из файла .env), иначе None."""
-    load_dotenv()
+# Файл .env ищется только в папке проекта (рядом с этим файлом),
+# а не в текущей папке и не в родительских каталогах.
+DOTENV_PATH = Path(__file__).resolve().parent / ".env"
+
+
+def load_token(dotenv_path=DOTENV_PATH):
+    """Вернуть токен из окружения или из файла .env, иначе None.
+
+    Уже заданная переменная окружения важнее значения из .env.
+    """
+    load_dotenv(dotenv_path, override=False)
     token = os.getenv(TOKEN_ENV_VAR, "").strip()
     return token or None

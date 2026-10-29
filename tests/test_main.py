@@ -253,3 +253,149 @@ def test_env_file_is_ignored():
     rules = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert ".env" in rules
     assert "!.env.example" in rules
+
+
+# --- Регрессия: ошибки ввода и прерывание ---------------------------------
+
+def raise_eof(prompt=""):
+    raise EOFError
+
+
+def raise_interrupt(prompt=""):
+    raise KeyboardInterrupt
+
+
+def test_eof_on_text_input(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(main, "load_token", lambda: FAKE_TOKEN)
+    monkeypatch.setattr("builtins.input", raise_eof)
+    code = main.main(["--result", str(tmp_path / "r.json")],
+                     client_factory=FakeDisk)
+    assert code == main.EXIT_NO_INPUT == 3
+    err = capsys.readouterr().err
+    assert "Не удалось прочитать ввод" in err
+    assert "Traceback" not in err
+    assert not (tmp_path / "r.json").exists()
+
+
+def test_eof_on_token_input(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(main, "load_token", lambda: None)
+    monkeypatch.setattr(main.getpass, "getpass", raise_eof)
+    created = []
+    code = main.main(["Hello", "--result", str(tmp_path / "r.json")],
+                     client_factory=lambda token: created.append(token))
+    assert code == main.EXIT_NO_INPUT
+    assert created == []  # клиент даже не создавался
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_ctrl_c_on_text_input(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(main, "load_token", lambda: FAKE_TOKEN)
+    monkeypatch.setattr("builtins.input", raise_interrupt)
+    code = main.main(["--result", str(tmp_path / "r.json")],
+                     client_factory=FakeDisk)
+    assert code == main.EXIT_INTERRUPTED == 130
+    assert "Остановлено пользователем" in capsys.readouterr().err
+
+
+def test_ctrl_c_on_token_input(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "load_token", lambda: None)
+    monkeypatch.setattr(main.getpass, "getpass", raise_interrupt)
+    assert main.main(["Hi", "--result", str(tmp_path / "r.json")],
+                     client_factory=FakeDisk) == main.EXIT_INTERRUPTED
+
+
+def test_ctrl_c_while_waiting_for_upload(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "load_token", lambda: FAKE_TOKEN)
+    disk = FakeDisk(fail_on=("wait", KeyboardInterrupt()))
+    report = tmp_path / "r.json"
+    assert main.main(["Hi", "--result", str(report)],
+                     client_factory=lambda token: disk) == 130
+    assert not report.exists()
+
+
+def test_empty_token_from_prompt(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(main, "load_token", lambda: None)
+    monkeypatch.setattr(main.getpass, "getpass", lambda prompt: "   ")
+    # Настоящий клиент отвергает пустой токен до любых запросов.
+    code = main.main(["Hi", "--result", str(tmp_path / "r.json")])
+    assert code == main.EXIT_DISK_ERROR
+    assert "Не указан OAuth-токен" in capsys.readouterr().err
+
+
+def test_report_write_error(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(main, "load_token", lambda: FAKE_TOKEN)
+    report = tmp_path / "no-such-dir" / "r.json"
+    code = main.main(["Hi", "--result", str(report)],
+                     client_factory=FakeDisk)
+    assert code == main.EXIT_REPORT_ERROR
+    err = capsys.readouterr().err
+    assert "Не удалось записать отчёт" in err
+    assert "Traceback" not in err
+
+
+@pytest.mark.parametrize("size", [None, "123", True, -1, 1.5])
+def test_invalid_size_from_disk(tmp_path, size):
+    report = tmp_path / "r.json"
+    with pytest.raises(YandexDiskError, match="размер"):
+        main.backup_cat("Hi", FakeDisk(size=size), report_path=report)
+    assert not report.exists()
+
+
+def test_real_process_without_stdin(tmp_path):
+    """Запуск как у пользователя: stdin закрыт, токена нет — без traceback."""
+    import os
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != "YANDEX_DISK_TOKEN"}
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "main.py")],
+        cwd=tmp_path, env=env, stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, encoding="utf-8", timeout=30,
+    )
+    assert result.returncode == 3
+    assert "Traceback" not in result.stderr
+    assert "Не удалось прочитать ввод" in result.stderr
+
+
+def test_env_variable_has_priority_over_dotenv(tmp_path, monkeypatch):
+    """На этом основана проверка ошибок без настоящего токена в docs/."""
+    import config
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("YANDEX_DISK_TOKEN=from-dotenv\n", encoding="utf-8")
+    monkeypatch.setenv("YANDEX_DISK_TOKEN", "from-environment")
+    assert config.load_token(dotenv) == "from-environment"
+
+
+def test_token_is_read_from_dotenv(tmp_path, monkeypatch):
+    import config
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("YANDEX_DISK_TOKEN=from-dotenv\n", encoding="utf-8")
+    # setenv + delenv: monkeypatch запомнит исходное состояние и вернёт его,
+    # даже если load_dotenv запишет значение в os.environ.
+    monkeypatch.setenv("YANDEX_DISK_TOKEN", "placeholder")
+    monkeypatch.delenv("YANDEX_DISK_TOKEN")
+    assert config.load_token(dotenv) == "from-dotenv"
+
+
+def test_missing_dotenv_gives_none(tmp_path, monkeypatch):
+    import config
+
+    # setenv + delenv: monkeypatch запомнит исходное состояние и вернёт его,
+    # даже если load_dotenv запишет значение в os.environ.
+    monkeypatch.setenv("YANDEX_DISK_TOKEN", "placeholder")
+    monkeypatch.delenv("YANDEX_DISK_TOKEN")
+    assert config.load_token(tmp_path / "absent.env") is None
+
+
+def test_dotenv_is_looked_up_in_project_folder():
+    import config
+
+    assert config.DOTENV_PATH == ROOT / ".env"
+
+
+def test_dotenv_tests_do_not_leak_token():
+    import os
+
+    assert os.environ.get("YANDEX_DISK_TOKEN") != "from-dotenv"

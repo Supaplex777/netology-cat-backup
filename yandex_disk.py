@@ -35,8 +35,24 @@ class RateLimitError(YandexDiskError):
     """Превышено ограничение API на количество запросов."""
 
 
+class ForbiddenError(YandexDiskError):
+    """Доступ запрещён или хранилище переполнено (HTTP 403)."""
+
+
+class NotFoundError(YandexDiskError):
+    """Ресурс не найден (HTTP 404)."""
+
+
 class ConflictError(YandexDiskError):
     """Ресурс с таким путём уже существует."""
+
+
+class ServerError(YandexDiskError):
+    """Сервер Яндекс.Диска временно недоступен (HTTP 5xx)."""
+
+
+class UnexpectedResponseError(YandexDiskError):
+    """Ответ API не похож на описанный в документации."""
 
 
 class UploadFailedError(YandexDiskError):
@@ -47,13 +63,70 @@ class UploadTimeoutError(YandexDiskError):
     """Загрузка не завершилась за отведённое время."""
 
 
+# Понятные пояснения к кодам, которые перечислены в документации API.
+STATUS_HINTS = {
+    400: "некорректные данные запроса",
+    404: "ресурс не найден",
+    406: "ресурс нельзя представить в нужном формате",
+    413: "файл слишком большой для вашего тарифа",
+    423: "технические работы или исчерпан лимит загрузок",
+    507: "на Диске не хватает свободного места",
+}
+
+MAX_DETAILS_LENGTH = 200
+
+
 def _error_text(response):
-    """Достать из ответа API понятное описание ошибки (без секретов)."""
+    """Достать из ответа API понятное описание ошибки (без секретов).
+
+    Тело ответа может быть пустым, не-JSON или JSON не того типа
+    (список, строка, число, null) — во всех случаях возвращается строка.
+    """
+    fallback = (STATUS_HINTS.get(getattr(response, "status_code", 0)) or
+                getattr(response, "reason", "") or
+                "нет описания")
     try:
         data = response.json()
     except ValueError:
-        return response.reason or "нет описания"
-    return data.get("description") or data.get("message") or "нет описания"
+        return fallback
+    if isinstance(data, dict):
+        for key in ("description", "message", "error"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:MAX_DETAILS_LENGTH]
+    return fallback
+
+
+def _json_object(response, action):
+    """Вернуть тело ответа как словарь или выбросить понятную ошибку."""
+    try:
+        data = response.json()
+    except ValueError as error:
+        raise UnexpectedResponseError(
+            f"{action}: Яндекс.Диск вернул ответ не в формате JSON "
+            f"(HTTP {response.status_code})."
+        ) from error
+    if not isinstance(data, dict):
+        raise UnexpectedResponseError(
+            f"{action}: ожидался JSON-объект, получен "
+            f"{type(data).__name__} (HTTP {response.status_code})."
+        )
+    return data
+
+
+def _link_href(response, action):
+    """Достать ссылку href из объекта Link, который возвращает API."""
+    data = _json_object(response, action)
+    href = data.get("href")
+    if not isinstance(href, str) or not href:
+        raise UnexpectedResponseError(
+            f"{action}: в ответе нет ссылки на операцию."
+        )
+    if data.get("templated") is True:
+        raise UnexpectedResponseError(
+            f"{action}: получена шаблонная ссылка, её нельзя использовать."
+        )
+    return href
 
 
 class YandexDiskClient:
@@ -113,15 +186,25 @@ class YandexDiskClient:
                 f"{action}: токен недействителен или устарел (HTTP 401)."
             )
         if code == 403:
-            raise AuthorizationError(
-                f"{action}: доступ запрещён (HTTP 403) — {details}"
+            # По документации 403 у загрузки и создания папки означает
+            # переполненное хранилище, у других методов — запрет доступа.
+            raise ForbiddenError(
+                f"{action}: доступ запрещён или хранилище переполнено "
+                f"(HTTP 403) — {details}"
             )
+        if code == 404:
+            raise NotFoundError(message)
         if code == 409:
             raise ConflictError(message)
         if code == 429:
             raise RateLimitError(
                 f"{action}: слишком много запросов (HTTP 429). "
                 "Подождите немного и повторите."
+            )
+        if code >= 500:
+            raise ServerError(
+                f"{action}: сервер Яндекс.Диска временно недоступен "
+                f"(HTTP {code}). Повторите позже."
             )
         raise YandexDiskError(message)
 
@@ -134,8 +217,9 @@ class YandexDiskClient:
         """Проверить доступность API и действительность токена."""
         response = self._request("GET", self.api_url,
                                  params={"fields": "total_space,used_space"})
-        self._raise_for_status(response, "Проверка доступа к Яндекс.Диску")
-        return response.json()
+        action = "Проверка доступа к Яндекс.Диску"
+        self._raise_for_status(response, action)
+        return _json_object(response, action)
 
     def get_metadata(self, path):
         """Вернуть метаданные файла или папки, либо None, если их нет."""
@@ -146,8 +230,9 @@ class YandexDiskClient:
         )
         if response.status_code == 404:
             return None
-        self._raise_for_status(response, f"Получение сведений о «{path}»")
-        return response.json()
+        action = f"Получение сведений о «{path}»"
+        self._raise_for_status(response, action)
+        return _json_object(response, action)
 
     def exists(self, path):
         """Проверить, существует ли файл или папка."""
@@ -190,13 +275,9 @@ class YandexDiskClient:
             "POST", self._resources_url("/upload"),
             params={"url": source_url, "path": path},
         )
-        self._raise_for_status(response, f"Запуск загрузки «{path}»")
-        href = response.json().get("href")
-        if not href:
-            raise YandexDiskError(
-                "Яндекс.Диск не вернул ссылку на операцию загрузки."
-            )
-        return href
+        action = f"Запуск загрузки «{path}»"
+        self._raise_for_status(response, action)
+        return _link_href(response, action)
 
     def _check_operation_url(self, href):
         """Не отправлять токен на чужие адреса."""
@@ -212,8 +293,14 @@ class YandexDiskClient:
         """Вернуть статус операции: success, failed или in-progress."""
         self._check_operation_url(href)
         response = self._request("GET", href)
-        self._raise_for_status(response, "Проверка статуса операции")
-        return response.json().get("status", "")
+        action = "Проверка статуса операции"
+        self._raise_for_status(response, action)
+        status = _json_object(response, action).get("status")
+        if not isinstance(status, str):
+            raise UnexpectedResponseError(
+                f"{action}: в ответе нет статуса операции."
+            )
+        return status
 
     def wait_for_operation(self, href, max_wait=UPLOAD_WAIT_SECONDS,
                            interval=UPLOAD_POLL_INTERVAL):
@@ -244,6 +331,7 @@ class YandexDiskClient:
             params={"from": source, "path": destination,
                     "overwrite": "false"},
         )
-        self._raise_for_status(response, f"Переименование «{source}»")
+        action = f"Переименование «{source}»"
+        self._raise_for_status(response, action)
         if response.status_code == 202:
-            self.wait_for_operation(response.json()["href"])
+            self.wait_for_operation(_link_href(response, action))
