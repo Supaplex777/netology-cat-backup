@@ -1,0 +1,18 @@
+# Настройки инструментов проверки (сам проект пакетом не является).
+
+[tool.ruff]
+line-length = 79
+target-version = "py311"
+extend-exclude = [".venv", "venv"]
+
+[tool.ruff.lint]
+# E/W — правила PEP8 (pycodestyle), F — pyflakes, I — порядок импортов,
+# N — имена по PEP8, B — частые ошибки.
+select = ["E", "W", "F", "I", "N", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cataas_api", "config", "main", "yandex_disk",
+                     "conftest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
