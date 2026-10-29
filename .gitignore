@@ -1,0 +1,28 @@
+# Секреты
+.env
+.env.*
+!.env.example
+
+# Виртуальные окружения
+.venv/
+venv/
+
+# Кэш Python и инструментов
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Результат запуска (личные данные, создаётся программой)
+result.json
+result.json.bak
+
+# Среды разработки и системные файлы
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
