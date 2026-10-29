@@ -111,7 +111,8 @@ def test_broken_report_is_kept_as_backup(tmp_path):
     report = tmp_path / "result.json"
     report.write_text("{broken", encoding="utf-8")
     main.backup_cat("cat", FakeDisk(), report_path=report)
-    assert (tmp_path / "result.json.bak").read_text() == "{broken"
+    backup = tmp_path / "result.json.bak"
+    assert backup.read_text(encoding="utf-8") == "{broken"
     assert len(read_report(report)) == 1
 
 
@@ -228,11 +229,15 @@ TOKEN_PATTERNS = [
 
 def project_files():
     try:
+        # -z и core.quotepath=false: имена с кириллицей не экранируются,
+        # иначе такие файлы молча выпали бы из проверки.
         output = subprocess.run(
-            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
-            cwd=ROOT, capture_output=True, text=True, check=True,
+            ["git", "-c", "core.quotepath=false", "ls-files", "-z",
+             "--cached", "--others", "--exclude-standard"],
+            cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
+            check=True,
         ).stdout
-        return [ROOT / name for name in output.splitlines()]
+        return [ROOT / name for name in output.split("\0") if name]
     except (OSError, subprocess.CalledProcessError):
         skip = {".git", ".venv", "venv", "__pycache__", ".pytest_cache"}
         return [p for p in ROOT.rglob("*")
@@ -341,20 +346,80 @@ def test_invalid_size_from_disk(tmp_path, size):
     assert not report.exists()
 
 
-def test_real_process_without_stdin(tmp_path):
-    """Запуск как у пользователя: stdin закрыт, токена нет — без traceback."""
+def child_env(**extra):
+    """Окружение дочернего процесса без токена и с заданными переменными."""
     import os
+
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("YANDEX_DISK_TOKEN", "PYTHONUTF8",
+                        "PYTHONIOENCODING")}
+    env.update(extra)
+    return env
+
+
+def run_main_without_stdin(tmp_path, env, encoding):
+    """Запустить main.py отдельным процессом с закрытым stdin.
+
+    Текст в программу не передаётся, поэтому она остановится на вводе
+    ещё до любых сетевых запросов — даже если в .env есть токен.
+    """
     import sys
 
-    env = {k: v for k, v in os.environ.items() if k != "YANDEX_DISK_TOKEN"}
-    result = subprocess.run(
+    return subprocess.run(
         [sys.executable, str(ROOT / "main.py")],
         cwd=tmp_path, env=env, stdin=subprocess.DEVNULL,
-        capture_output=True, text=True, encoding="utf-8", timeout=30,
+        capture_output=True, text=True, encoding=encoding,
+        errors="replace", timeout=30,
     )
-    assert result.returncode == 3
+
+
+def test_real_process_without_stdin(tmp_path):
+    """Запуск как у пользователя: stdin закрыт, токена нет — без traceback.
+
+    Дочернему процессу явно задаётся UTF-8 (PYTHONUTF8 и PYTHONIOENCODING),
+    поэтому тест не зависит от кодировки консоли Windows и одинаково
+    работает в Linux и macOS. Глобальные настройки не меняются.
+    """
+    env = child_env(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    result = run_main_without_stdin(tmp_path, env, "utf-8")
+    assert result.returncode == main.EXIT_NO_INPUT
     assert "Traceback" not in result.stderr
     assert "Не удалось прочитать ввод" in result.stderr
+
+
+@pytest.mark.parametrize("encoding", ["cp1251", "cp866", "ascii"])
+def test_real_process_with_legacy_console_encoding(tmp_path, encoding):
+    """Старая кодировка консоли не приводит к UnicodeEncodeError.
+
+    cp1251 и cp866 — типичные кодировки Windows; в ascii нет даже
+    кириллицы, такие символы должны выводиться как \\uXXXX.
+    """
+    env = child_env(PYTHONUTF8="0", PYTHONIOENCODING=encoding)
+    result = run_main_without_stdin(tmp_path, env, encoding)
+    output = result.stdout + result.stderr
+    assert result.returncode == main.EXIT_NO_INPUT
+    assert "Traceback" not in output
+    assert "UnicodeEncodeError" not in output
+    if encoding != "ascii":
+        assert "Не удалось прочитать ввод" in result.stderr
+
+
+def test_configure_console_tolerates_unencodable_text(monkeypatch):
+    import io
+    import sys
+
+    raw = io.BytesIO()
+    strict_ascii = io.TextIOWrapper(raw, encoding="ascii")  # errors=strict
+    monkeypatch.setattr(sys, "stdout", strict_ascii)
+    main.configure_console()
+    strict_ascii.write("Котик 🐱")
+    strict_ascii.flush()
+    assert raw.getvalue() == b"\\u041a\\u043e\\u0442\\u0438\\u043a \\U0001f431"
+
+
+def test_configure_console_runs_on_current_streams():
+    # Не должен падать на потоках pytest (у них может не быть reconfigure).
+    main.configure_console()
 
 
 def test_env_variable_has_priority_over_dotenv(tmp_path, monkeypatch):

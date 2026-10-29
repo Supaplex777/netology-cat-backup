@@ -42,6 +42,22 @@ class SecretFilter(logging.Filter):
         return True
 
 
+def configure_console():
+    """Не падать, если консоль не умеет показывать какой-то символ.
+
+    В консоли со старой кодировкой (например, cp1251 или ascii) символы,
+    которые нельзя отобразить, выводятся как \\uXXXX, а не вызывают
+    UnicodeEncodeError. Глобальные настройки системы не меняются.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="backslashreplace")
+            except (OSError, ValueError):
+                pass
+
+
 def setup_logging(token=None, level=logging.INFO):
     """Настроить вывод хода работы в консоль."""
     handler = logging.StreamHandler()
@@ -175,6 +191,7 @@ def ask(prompt, hidden=False):
 
 def main(argv=None, client_factory=YandexDiskClient):
     args = parse_args(argv)
+    configure_console()
     token = load_token()
     setup_logging(token)
     logger.info("Запуск резервного копирования")
